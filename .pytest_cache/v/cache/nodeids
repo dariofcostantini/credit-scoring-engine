@@ -1,0 +1,5 @@
+[
+  "test/test_rules.py::test_good_candidate_score",
+  "test/test_rules.py::test_hard_knockout_high_debt",
+  "test/test_rules.py::test_hard_knockout_underage"
+]

@@ -1,0 +1,13 @@
+# Created by pytest automatically.
+# Archivos de sistema de Mac
+.DS_Store
+
+# Archivos compilados de Python (Basura)
+__pycache__/
+*.pyc
+
+# Archivos de cache de pytest
+.pytest_cache/
+
+# Bases de datos locales (Opcional, pero buena práctica no subir binarios grandes)
+*.db
