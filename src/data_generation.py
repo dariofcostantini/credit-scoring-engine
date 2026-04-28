@@ -1,51 +1,148 @@
-import pandas as pd
+import logging
+import os
+
 import numpy as np
-import random
+import pandas as pd
 
-def generate_mock_data(num_records=1000):
+logger = logging.getLogger(__name__)
+
+# --- Constantes de Generación de Datos ---
+
+RANDOM_SEED = 42
+DEFAULT_NUM_RECORDS = 2000
+FIRST_APPLICANT_ID = 1000
+
+# Distribución de estados BCRA (calibrada para reflejar la realidad argentina)
+BCRA_STATUS_VALUES = [1, 2, 3, 4, 5, 6]
+BCRA_STATUS_PROBABILITIES = [0.96, 0.02, 0.01, 0.004, 0.003, 0.003]
+BCRA_HISTORY_MONTHS = 12
+
+# Parámetros demográficos y financieros
+MIN_AGE = 18
+MAX_AGE = 75
+MEAN_ANNUAL_INCOME = 540_000
+STD_ANNUAL_INCOME = 150_000
+MAX_EMPLOYMENT_YEARS = 40
+MAX_CONTRIBUTION_MONTHS = 13          # meses_aportes: 0 a 12
+MAX_CURRENT_DEBT = 200_000
+MIN_LOAN_AMOUNT = 1_000
+MAX_LOAN_AMOUNT = 50_000
+
+# Distribución del historial de pagos (Nosis)
+PAYMENT_SCORE_VALUES = [0, 1, 2, 3]
+PAYMENT_SCORE_PROBABILITIES = [0.1, 0.2, 0.4, 0.3]
+
+# --- Ruta de salida ---
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_OUTPUT_PATH = os.path.join(PROJECT_ROOT, "data", "raw", "applicants.xlsx")
+
+
+def _generate_bcra_histories(num_records: int) -> list[str]:
+    """Genera historiales BCRA simulados de 12 meses para cada solicitante.
+
+    Cada historial es un string con formato "1|1|2|1|..." que representa
+    la situación BCRA mensual durante el último año.
+
+    Args:
+        num_records: Cantidad de historiales a generar.
+
+    Returns:
+        Lista de strings con formato "estado1|estado2|...|estado12".
     """
-    Genera un dataset ficticio de solicitantes de crédito.
+    histories = []
+    for _ in range(num_records):
+        monthly_statuses = np.random.choice(
+            BCRA_STATUS_VALUES, BCRA_HISTORY_MONTHS, p=BCRA_STATUS_PROBABILITIES
+        )
+        history_str = "|".join(map(str, monthly_statuses))
+        histories.append(history_str)
+    return histories
+
+
+def _inject_edge_cases(df: pd.DataFrame) -> pd.DataFrame:
+    """Introduce casos extremos para validar reglas de Hard Knockout.
+
+    Modifica las primeras filas del DataFrame para crear escenarios
+    que deberían ser rechazados automáticamente por el motor de riesgo.
+
+    Args:
+        df: DataFrame de solicitantes generados.
+
+    Returns:
+        DataFrame con los edge cases inyectados.
     """
-    np.random.seed(42) # Para reproducibilidad
-
-    data = {
-        'applicant_id': range(1000, 1000 + num_records),
-        'age': np.random.randint(18, 75, num_records),
-        'annual_income': np.random.normal(55000, 15000, num_records).astype(int),
-        'employment_years': np.random.randint(0, 40, num_records),
-        'current_debt': np.random.randint(0, 20000, num_records),
-        'loan_amount_requested': np.random.randint(1000, 50000, num_records),
-        
-        # Historial de pagos: 0 (malo), 1 (regular), 2 (bueno), 3 (excelente)
-        'payment_history_score': np.random.choice([0, 1, 2, 3], num_records, p=[0.1, 0.2, 0.4, 0.3])
-    }
-    
-    df = pd.DataFrame(data)
-
-    # Introducir algunos casos extremos para probar reglas de "Hard Knockout"
-    # Caso 1: Ingresos negativos (Error de datos)
+    # Caso 1: Ingresos negativos (simula error de datos)
     df.loc[0:5, 'annual_income'] = -100
-    
-    # Caso 2: Menores de edad (Fraude/Error)
-    df.loc[6:10, 'age'] = 17
-    
-    # Caso 3: Deuda excesiva
-    df.loc[11:15, 'current_debt'] = 1000000
+
+    # Caso 2: Menores de edad (simula fraude o error de carga)
+    df.loc[6:10, 'age'] = 15
+
+    # Caso 3: Deuda excesiva (simula sobre-endeudamiento extremo)
+    df.loc[11:15, 'current_debt'] = 1_000_000
 
     return df
 
+
+def generate_mock_data(num_records: int = DEFAULT_NUM_RECORDS) -> pd.DataFrame:
+    """Genera un dataset ficticio de solicitantes de crédito.
+
+    Crea datos aleatorios pero reproducibles (seed fijo) que simulan
+    un portafolio realista de solicitantes argentinos, incluyendo
+    edge cases para validación del motor de reglas.
+
+    Args:
+        num_records: Cantidad de solicitantes a generar.
+
+    Returns:
+        DataFrame con los datos de solicitantes, incluyendo edge cases.
+    """
+    np.random.seed(RANDOM_SEED)
+
+    bcra_histories = _generate_bcra_histories(num_records)
+
+    data = {
+        'applicant_id': range(FIRST_APPLICANT_ID, FIRST_APPLICANT_ID + num_records),
+        'cuit': [
+            f"20{np.random.randint(10000000, 45000000)}{np.random.randint(0, 9)}"
+            for _ in range(num_records)
+        ],
+        'age': np.random.randint(MIN_AGE, MAX_AGE, num_records),
+        'annual_income': np.random.normal(
+            MEAN_ANNUAL_INCOME, STD_ANNUAL_INCOME, num_records
+        ).astype(int),
+        'situation_bcra': [int(h.split('|')[-1]) for h in bcra_histories],
+        'historial_bcra': bcra_histories,
+        'employment_years': np.random.randint(0, MAX_EMPLOYMENT_YEARS, num_records),
+        'meses_aportes': np.random.randint(0, MAX_CONTRIBUTION_MONTHS, num_records),
+        'current_debt': np.random.randint(0, MAX_CURRENT_DEBT, num_records),
+        'loan_amount_requested': np.random.randint(
+            MIN_LOAN_AMOUNT, MAX_LOAN_AMOUNT, num_records
+        ),
+        'payment_history_score': np.random.choice(
+            PAYMENT_SCORE_VALUES, num_records, p=PAYMENT_SCORE_PROBABILITIES
+        ),
+    }
+
+    df = pd.DataFrame(data)
+    df = _inject_edge_cases(df)
+
+    return df
+
+
 if __name__ == "__main__":
-    print("Generando datos ficticios...")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    logger.info("Generando datos ficticios...")
     df_applicants = generate_mock_data()
-    
-    # Guardar en la carpeta data/raw
-    output_path = "../data/raw/applicants.csv"
-    # Ajusta la ruta si ejecutas desde dentro de src/ o desde la raíz
-    try:
-        df_applicants.to_csv(output_path, index=False)
-        print(f"Datos guardados exitosamente en {output_path}")
-        print(df_applicants.head())
-    except OSError:
-        # Fallback por si la carpeta no existe (para testing rápido)
-        df_applicants.to_csv("applicants.csv", index=False)
-        print("Carpeta no encontrada, guardado en directorio actual como applicants.csv")
+
+    # Asegurar que el directorio de salida exista
+    os.makedirs(os.path.dirname(DEFAULT_OUTPUT_PATH), exist_ok=True)
+
+    df_applicants.to_excel(DEFAULT_OUTPUT_PATH, index=False)
+    logger.info("Datos guardados exitosamente en %s", DEFAULT_OUTPUT_PATH)
+    logger.info("Primeras 5 filas:")
+    print(df_applicants.head())

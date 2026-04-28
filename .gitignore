@@ -1,0 +1,20 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Data files (no subir datos sensibles/pesados)
+data/processed/
+data/raw/*.xlsx
+data/raw/*.csv
+
+# IDE
+.vscode/
+.idea/
+
+# Notas personales
++Info/

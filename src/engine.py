@@ -1,95 +1,144 @@
-import pandas as pd
-import sqlite3
+import logging
 import os
-import sys
+import sqlite3
 
-# --- EL TRUCO MÁGICO ---
-# Esto asegura que Python encuentre el módulo 'src' sin importar desde dónde lo ejecutes
-current_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.dirname(current_dir)
-sys.path.append(parent_dir)
-# -----------------------
+import pandas as pd
 
-from src.rules import CreditScoringRules
+try:
+    from .rules import CreditScoringRules          # Cuando se ejecuta como módulo: python -m src.engine
+except ImportError:
+    from rules import CreditScoringRules            # Cuando se ejecuta directo: python src/engine.py
+
+logger = logging.getLogger(__name__)
+
+
 class CreditRiskEngine:
-    def __init__(self, db_path="data/processed/scoring_results.db"):
+    """Orquestador del pipeline ETL de scoring crediticio.
+
+    Coordina las tres fases del proceso:
+    1. Ingesta (Extract): lectura de datos raw desde Excel.
+    2. Scoring (Transform): aplicación de reglas de negocio.
+    3. Persistencia (Load): almacenamiento en SQLite.
+    """
+
+    REQUIRED_COLUMNS = {
+        'applicant_id', 'age', 'annual_income', 'current_debt',
+        'situation_bcra', 'historial_bcra', 'employment_years',
+        'meses_aportes', 'payment_history_score',
+    }
+
+    DEFAULT_SCORE = 0
+    DEFAULT_PD = 1.0  # PD = 1.0 para rechazados (máximo riesgo)
+
+    def __init__(self, db_path: str = "data/processed/scoring_results.db"):
         self.rules = CreditScoringRules()
         self.db_path = db_path
-        self.raw_data = None
-        
-    def ingest_data(self, filepath):
+        self.raw_data: pd.DataFrame | None = None
+
+    def ingest_data(self, filepath: str) -> None:
+        """Paso 1 — Ingesta (Extract): Lee el archivo XLSX raw.
+
+        Args:
+            filepath: Ruta al archivo Excel con los datos de solicitantes.
+
+        Raises:
+            FileNotFoundError: Si el archivo no existe en la ruta indicada.
+            ValueError: Si el archivo no contiene las columnas requeridas.
         """
-        Paso 1: Ingesta (Extract)
-        Lee el archivo CSV raw.
-        """
-        print(f"📥 Leyendo datos desde: {filepath}")
+        logger.info("Leyendo datos desde: %s", filepath)
+
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"El archivo {filepath} no existe.")
-            
-        self.raw_data = pd.read_csv(filepath)
-        print(f"   -> {len(self.raw_data)} registros cargados.")
 
-    def run_scoring_pipeline(self):
+        self.raw_data = pd.read_excel(filepath)
+        logger.info("%d registros cargados.", len(self.raw_data))
+
+        # Validación de columnas requeridas
+        missing_columns = self.REQUIRED_COLUMNS - set(self.raw_data.columns)
+        if missing_columns:
+            raise ValueError(f"Columnas faltantes en el archivo: {missing_columns}")
+
+    def run_scoring_pipeline(self) -> pd.DataFrame:
+        """Paso 2 — Scoring (Transform): Aplica reglas de negocio a cada solicitante.
+
+        Itera sobre cada cliente, aplica hard knockouts y, si pasa,
+        calcula el credit score y la probabilidad de default.
+
+        Returns:
+            DataFrame con los resultados del scoring por solicitante.
+
+        Raises:
+            RuntimeError: Si se ejecuta sin haber cargado datos previamente.
         """
-        Paso 2: Procesamiento (Transform)
-        Itera sobre cada cliente y aplica las reglas de negocio.
-        """
-        print("⚙️ Ejecutando motor de riesgo...")
+        if self.raw_data is None:
+            raise RuntimeError("No hay datos cargados. Ejecutá ingest_data() primero.")
+
+        logger.info("Ejecutando motor de riesgo sobre %d registros...", len(self.raw_data))
         results = []
 
-        # Iteramos fila por fila (simulando un proceso caso por caso)
-        for index, row in self.raw_data.iterrows():
-            applicant_id = row['applicant_id']
-            
+        for _, row in self.raw_data.iterrows():
             # 1. Aplicar Hard Knockouts
             is_rejected, reason = self.rules.check_hard_knockouts(row)
-            
+
             # 2. Si pasa, calcular Score
-            score = 0
+            credit_score = self.DEFAULT_SCORE
+            probability_of_default = self.DEFAULT_PD
+
             if not is_rejected:
-                score = self.rules.calculate_score(row)
-            
-            # Guardamos el resultado estructurado
+                credit_score, probability_of_default = self.rules.calculate_score(row)
+
+            # 3. Guardar resultado estructurado
             results.append({
-                'applicant_id': applicant_id,
+                'applicant_id': row['applicant_id'],
                 'is_rejected': is_rejected,
                 'rejection_reason': reason,
-                'credit_score': score,
-                'original_income': row['annual_income'], # Trazabilidad
-                'original_debt': row['current_debt']      # Trazabilidad
+                'credit_score': credit_score,
+                'probability_of_default': probability_of_default,
+                'original_income': row['annual_income'],
+                'original_debt': row['current_debt'],
             })
-            
-        return pd.DataFrame(results)
 
-    def save_to_sql(self, df_results):
+        scored_df = pd.DataFrame(results)
+        logger.info("Scoring completado. %d aprobados, %d rechazados.",
+                     len(scored_df[~scored_df['is_rejected']]),
+                     len(scored_df[scored_df['is_rejected']]))
+        return scored_df
+
+    def save_to_sql(self, df_results: pd.DataFrame) -> None:
+        """Paso 3 — Persistencia (Load): Guarda resultados en SQLite.
+
+        Args:
+            df_results: DataFrame con los resultados del scoring.
         """
-        Paso 3: Persistencia (Load)
-        Guarda los resultados en una base de datos SQLite.
-        """
-        print(f"💾 Guardando resultados en SQL: {self.db_path}")
-        
+        logger.info("Guardando %d resultados en SQL: %s", len(df_results), self.db_path)
+
         # Aseguramos que el directorio exista
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        
-        # Conexión a SQLite (se crea el archivo si no existe)
-        conn = sqlite3.connect(self.db_path)
-        
-        # Guardar tabla (si existe, la reemplaza para este ejercicio)
-        df_results.to_sql('risk_scoring_results', conn, if_exists='replace', index=False)
-        
-        conn.close()
-        print("✅ Proceso finalizado con éxito.")
+
+        # Context manager garantiza cierre de conexión incluso si hay errores
+        with sqlite3.connect(self.db_path) as conn:
+            df_results.to_sql('risk_scoring_results', conn, if_exists='replace', index=False)
+
+        logger.info("Proceso finalizado con éxito.")
+
 
 # Bloque principal para ejecución directa
 if __name__ == "__main__":
-    # Rutas relativas
-    INPUT_FILE = "data/raw/applicants.csv"
+    # Configurar logging para ejecución por consola
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    # Rutas relativas (ejecutar desde la raíz del proyecto)
+    INPUT_FILE = "data/raw/applicants.xlsx"
     DB_FILE = "data/processed/scoring_results.db"
-    
+
     engine = CreditRiskEngine(db_path=DB_FILE)
     engine.ingest_data(INPUT_FILE)
     scored_df = engine.run_scoring_pipeline()
     engine.save_to_sql(scored_df)
-    
-    print("\n--- Vista Previa de Resultados ---")
-    print(scored_df.head(10))
+
+    logger.info("--- Vista Previa de Resultados ---")
+    print(scored_df)
